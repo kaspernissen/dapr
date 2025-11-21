@@ -21,11 +21,17 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	"github.com/dapr/dapr/pkg/runtime/wfengine/todo"
 	"github.com/dapr/durabletask-go/backend"
 )
+
+var tracer = otel.Tracer("dapr-workflow-orchestrator")
 
 func (o *orchestrator) callActivities(ctx context.Context, es []*backend.HistoryEvent, generation uint64) error {
 	for _, e := range es {
@@ -50,9 +56,77 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 		return nil
 	}
 
-	var eventData []byte
-	eventData, err := proto.Marshal(e)
+	// Start producer span for activity scheduling
+	activityName := ts.GetName()
+	spanName := fmt.Sprintf("schedule %s", activityName)
+
+	// Load workflow state to get stored trace context
+	state, _, err := o.loadInternalState(ctx)
 	if err != nil {
+		log.Errorf("Workflow actor '%s': failed to load state for trace context: %v", o.actorID, err)
+	}
+
+	// Use stored trace context as span link for activity scheduling span
+	var spanLinks []trace.Link
+	if state != nil && state.TraceContext != nil {
+		tc := state.TraceContext
+		traceID, err1 := trace.TraceIDFromHex(tc.TraceID)
+		spanID, err2 := trace.SpanIDFromHex(tc.SpanID)
+
+		if err1 == nil && err2 == nil {
+			var flags trace.TraceFlags
+			fmt.Sscanf(tc.TraceFlags, "%02x", &flags)
+
+			var traceState trace.TraceState
+			if tc.TraceState != "" {
+				traceState, _ = trace.ParseTraceState(tc.TraceState)
+			}
+
+			linkedSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+				TraceID:    traceID,
+				SpanID:     spanID,
+				TraceFlags: flags,
+				TraceState: traceState,
+				Remote:     true,
+			})
+
+			spanLinks = append(spanLinks, trace.Link{
+				SpanContext: linkedSpanCtx,
+				Attributes: []attribute.KeyValue{
+					attribute.String("link.type", "follows_from"),
+					attribute.String("workflow.instance.id", o.actorID),
+				},
+			})
+
+			log.Debugf("Workflow actor '%s': using stored trace context as span link for activity '%s': traceID=%s spanID=%s",
+				o.actorID, activityName, traceID, spanID)
+		} else {
+			log.Warnf("Workflow actor '%s': failed to parse stored trace context for activity '%s': %v, %v",
+				o.actorID, activityName, err1, err2)
+		}
+	} else {
+		log.Warnf("Workflow actor '%s': no stored trace context found for activity '%s'", o.actorID, activityName)
+	}
+
+	ctx, span := tracer.Start(ctx, spanName,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithLinks(spanLinks...),
+	)
+	defer func() {
+		span.End()
+	}()
+	span.SetAttributes(
+		attribute.String("messaging.operation.name", "publish"),
+		attribute.String("workflow.activity.name", activityName),
+		attribute.String("workflow.instance.id", o.actorID),
+		attribute.Int("workflow.activity.event_id", int(e.GetEventId())),
+		attribute.Int("workflow.generation", int(generation)),
+	)
+
+	var eventData []byte
+	eventData, err = proto.Marshal(e)
+	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -67,13 +141,26 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 
 	log.Debugf("Workflow actor '%s': invoking execute method on activity actor '%s||%s'", o.actorID, activityActorType, targetActorID)
 
+	// Inject trace context into metadata for span linking
+	spanCtx := span.SpanContext()
+	metadata := map[string][]string{
+		"wf-trace-id":    {spanCtx.TraceID().String()},
+		"wf-span-id":     {spanCtx.SpanID().String()},
+		"wf-trace-flags": {fmt.Sprintf("%02x", spanCtx.TraceFlags())},
+	}
+	if spanCtx.TraceState().String() != "" {
+		metadata["wf-trace-state"] = []string{spanCtx.TraceState().String()}
+	}
+
 	_, err = o.router.Call(ctx, internalsv1pb.
 		NewInternalInvokeRequest("Execute").
 		WithActor(activityActorType, targetActorID).
 		WithData(eventData).
+		WithMetadata(metadata).
 		WithContentType(invokev1.ProtobufContentType),
 	)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to invoke activity actor '%s' to execute '%s': %w", targetActorID, ts.GetName(), err)
 	}
 

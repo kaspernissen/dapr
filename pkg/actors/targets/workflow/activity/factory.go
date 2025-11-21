@@ -63,8 +63,9 @@ type factory struct {
 	reminderInterval   time.Duration
 	schedulerReminders bool
 
-	table sync.Map
-	lock  sync.Mutex
+	table         sync.Map
+	traceContexts sync.Map // stores trace context metadata for span linking
+	lock          sync.Mutex
 }
 
 func New(ctx context.Context, opts Options) (targets.Factory, error) {

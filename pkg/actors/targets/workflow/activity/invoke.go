@@ -48,6 +48,26 @@ func (a *activity) handleInvoke(ctx context.Context, req *internalsv1pb.Internal
 		return nil, fmt.Errorf("failed to decode activity request: %w", err)
 	}
 
+	// Extract and store trace context metadata for span linking
+	if req.Metadata != nil {
+		traceCtx := make(map[string]string)
+		if traceID := req.Metadata["wf-trace-id"]; traceID != nil && len(traceID.Values) > 0 {
+			traceCtx["trace-id"] = traceID.Values[0]
+		}
+		if spanID := req.Metadata["wf-span-id"]; spanID != nil && len(spanID.Values) > 0 {
+			traceCtx["span-id"] = spanID.Values[0]
+		}
+		if traceFlags := req.Metadata["wf-trace-flags"]; traceFlags != nil && len(traceFlags.Values) > 0 {
+			traceCtx["trace-flags"] = traceFlags.Values[0]
+		}
+		if traceState := req.Metadata["wf-trace-state"]; traceState != nil && len(traceState.Values) > 0 {
+			traceCtx["trace-state"] = traceState.Values[0]
+		}
+		if len(traceCtx) > 0 {
+			a.traceContexts.Store(a.actorID, traceCtx)
+		}
+	}
+
 	// The actual execution is triggered by a reminder
 	return nil, a.createReminder(ctx, &his)
 }
@@ -60,12 +80,20 @@ func (a *activity) handleReminder(ctx context.Context, reminder *actorapi.Remind
 		return fmt.Errorf("failed to decode activity reminder: %w", err)
 	}
 
-	err := a.executeActivity(ctx, reminder.Name, &state)
+	// Retrieve trace context for span linking
+	var traceCtx map[string]string
+	if val, ok := a.traceContexts.Load(a.actorID); ok {
+		traceCtx = val.(map[string]string)
+	}
+
+	err := a.executeActivity(ctx, reminder.Name, &state, traceCtx)
 
 	// Returning nil signals that we want the execution to be retried in the next
 	// period interval
 	switch {
 	case err == nil:
+		// Clean up trace context on successful completion
+		a.traceContexts.Delete(a.actorID)
 		if a.schedulerReminders {
 			return nil
 		}

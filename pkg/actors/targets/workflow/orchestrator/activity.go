@@ -22,6 +22,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
 	wfenginestate "github.com/dapr/dapr/pkg/runtime/wfengine/state"
@@ -38,7 +42,7 @@ func (o *orchestrator) callActivities(ctx context.Context, es []*backend.History
 	}
 
 	for _, e := range es {
-		err := o.callActivity(ctx, e, dueTime, state.Generation)
+		err := o.callActivity(ctx, e, dueTime, state)
 		if err != nil {
 			if errors.Is(err, todo.ErrDuplicateInvocation) {
 				log.Warnf("Workflow actor '%s': activity invocation '%s::%d' was flagged as a duplicate and will be skipped", o.actorID, e.GetTaskScheduled().GetName(), e.GetEventId())
@@ -52,16 +56,83 @@ func (o *orchestrator) callActivities(ctx context.Context, es []*backend.History
 	return nil
 }
 
-func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent, dueTime time.Time, generation uint64) error {
+func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent, dueTime time.Time, state *wfenginestate.State) error {
 	ts := e.GetTaskScheduled()
 	if ts == nil {
 		log.Warnf("Workflow actor '%s': unable to process task '%v'", o.actorID, e)
 		return nil
 	}
 
+	// Start producer span for activity scheduling
+	activityName := ts.GetName()
+	spanName := fmt.Sprintf("schedule %s", activityName)
+
+	// Use stored trace context as span link for activity scheduling span
+	var spanLinks []trace.Link
+	if state.TraceContext != nil {
+		tc := state.TraceContext
+		traceID, err1 := trace.TraceIDFromHex(tc.TraceID)
+		spanID, err2 := trace.SpanIDFromHex(tc.SpanID)
+
+		if err1 == nil && err2 == nil {
+			var flags trace.TraceFlags
+			fmt.Sscanf(tc.TraceFlags, "%02x", &flags)
+
+			var traceState trace.TraceState
+			if tc.TraceState != "" {
+				traceState, _ = trace.ParseTraceState(tc.TraceState)
+			}
+
+			linkedSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+				TraceID:    traceID,
+				SpanID:     spanID,
+				TraceFlags: flags,
+				TraceState: traceState,
+				Remote:     true,
+			})
+
+			spanLinks = append(spanLinks, trace.Link{
+				SpanContext: linkedSpanCtx,
+				Attributes: []attribute.KeyValue{
+					attribute.String("link.type", "follows_from"),
+					attribute.String("workflow.instance.id", o.actorID),
+				},
+			})
+
+			log.Infof("Workflow actor '%s': CREATED SPAN LINK for activity '%s': linkTraceID=%s linkSpanID=%s flags=%s",
+				o.actorID, activityName, traceID, spanID, flags)
+		} else {
+			log.Warnf("Workflow actor '%s': FAILED to parse stored trace context for activity '%s': traceErr=%v spanErr=%v",
+				o.actorID, activityName, err1, err2)
+		}
+	} else {
+		log.Warnf("Workflow actor '%s': NO STORED TRACE CONTEXT found for activity '%s'", o.actorID, activityName)
+	}
+
+	ctx, span := otel.Tracer("dapr-workflow-orchestrator").Start(ctx, spanName,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithLinks(spanLinks...),
+	)
+	defer func() {
+		span.End()
+	}()
+
+	producerSpanCtx := span.SpanContext()
+	log.Infof("Workflow actor '%s': CREATED PRODUCER SPAN for activity '%s': spanName='%s' traceID=%s spanID=%s hasLinks=%d",
+		o.actorID, activityName, spanName, producerSpanCtx.TraceID(), producerSpanCtx.SpanID(), len(spanLinks))
+
+	span.SetAttributes(
+		attribute.String("messaging.operation.name", "publish"),
+		attribute.String("workflow.activity.name", activityName),
+		attribute.String("workflow.instance.id", o.actorID),
+		attribute.Int("workflow.activity.event_id", int(e.GetEventId())),
+		attribute.Int("workflow.generation", int(state.Generation)),
+	)
+
 	var eventData []byte
 	eventData, err := proto.Marshal(e)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -70,22 +141,36 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 		activityActorType = o.actorTypeBuilder.Activity(router.GetTargetAppID())
 	}
 
-	targetActorID := buildActivityActorID(o.actorID, e.GetEventId(), generation)
+	targetActorID := buildActivityActorID(o.actorID, e.GetEventId(), state.Generation)
 
 	o.activityResultAwaited.Store(true)
 
 	log.Debugf("Workflow actor '%s': invoking execute method on activity actor '%s||%s'", o.actorID, activityActorType, targetActorID)
 
+	// Inject trace context into metadata for span linking
+	spanCtx := span.SpanContext()
+	metadata := map[string][]string{
+		todo.MetadataActivityReminderDueTime: {strconv.FormatInt(dueTime.UnixMilli(), 10)},
+		"wf-trace-id":                        {spanCtx.TraceID().String()},
+		"wf-span-id":                         {spanCtx.SpanID().String()},
+		"wf-trace-flags":                     {fmt.Sprintf("%02x", spanCtx.TraceFlags())},
+	}
+	if spanCtx.TraceState().String() != "" {
+		metadata["wf-trace-state"] = []string{spanCtx.TraceState().String()}
+	}
+
+	log.Infof("Workflow actor '%s': INJECTING trace context into metadata for activity '%s': traceID=%s spanID=%s flags=%s",
+		o.actorID, activityName, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags())
+
 	_, err = o.router.Call(ctx, internalsv1pb.
 		NewInternalInvokeRequest("Execute").
 		WithActor(activityActorType, targetActorID).
-		WithMetadata(map[string][]string{
-			todo.MetadataActivityReminderDueTime: {strconv.FormatInt(dueTime.UnixMilli(), 10)},
-		}).
+		WithMetadata(metadata).
 		WithData(eventData).
 		WithContentType(invokev1.ProtobufContentType),
 	)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to invoke activity actor '%s' to execute '%s': %w", targetActorID, ts.GetName(), err)
 	}
 

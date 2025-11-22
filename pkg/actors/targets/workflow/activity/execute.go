@@ -22,6 +22,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	diag "github.com/dapr/dapr/pkg/diagnostics"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	internalsv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
@@ -31,7 +35,9 @@ import (
 	"github.com/dapr/durabletask-go/backend"
 )
 
-func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *backend.HistoryEvent) error {
+func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *backend.HistoryEvent, traceCtx map[string]string) error {
+	log.Infof("Activity actor '%s': EXECUTE ACTIVITY CALLED: name='%s' hasTraceCtx=%v", a.actorID, name, traceCtx != nil)
+
 	activityName := ""
 	if ts := taskEvent.GetTaskScheduled(); ts != nil {
 		activityName = ts.GetName()
@@ -39,11 +45,87 @@ func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *
 		return fmt.Errorf("invalid activity task event: '%s'", taskEvent.String())
 	}
 
+	log.Infof("Activity actor '%s': Activity name extracted: '%s'", a.actorID, activityName)
+
 	endIndex := strings.Index(a.actorID, "::")
 	if endIndex < 0 {
 		return fmt.Errorf("invalid activity actor ID: '%s'", a.actorID)
 	}
 	workflowID := a.actorID[0:endIndex]
+	log.Infof("Activity actor '%s': Workflow ID: '%s'", a.actorID, workflowID)
+
+	// Reconstruct producer span context and use as span link
+	var spanLinks []trace.Link
+	if traceCtx != nil && len(traceCtx) > 0 {
+		log.Infof("Activity actor '%s': Processing trace context for span link: %v", a.actorID, traceCtx)
+		if traceIDStr, ok := traceCtx["trace-id"]; ok {
+			if spanIDStr, ok2 := traceCtx["span-id"]; ok2 {
+				log.Infof("Activity actor '%s': Parsing traceID=%s spanID=%s", a.actorID, traceIDStr, spanIDStr)
+				traceID, err1 := trace.TraceIDFromHex(traceIDStr)
+				spanID, err2 := trace.SpanIDFromHex(spanIDStr)
+				if err1 == nil && err2 == nil {
+					var flags trace.TraceFlags
+					if flagsStr, ok3 := traceCtx["trace-flags"]; ok3 {
+						fmt.Sscanf(flagsStr, "%02x", &flags)
+					}
+
+					var traceState trace.TraceState
+					if stateStr, ok4 := traceCtx["trace-state"]; ok4 && stateStr != "" {
+						traceState, _ = trace.ParseTraceState(stateStr)
+					}
+
+					producerSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+						TraceID:    traceID,
+						SpanID:     spanID,
+						TraceFlags: flags,
+						TraceState: traceState,
+						Remote:     true,
+					})
+
+					// Create span link to producer span
+					spanLinks = append(spanLinks, trace.Link{
+						SpanContext: producerSpanCtx,
+						Attributes: []attribute.KeyValue{
+							attribute.String("link.type", "follows_from"),
+							attribute.String("workflow.instance.id", string(workflowID)),
+						},
+					})
+					log.Infof("Activity actor '%s': CREATED SPAN LINK: linkTraceID=%s linkSpanID=%s flags=%s",
+						a.actorID, traceID, spanID, flags)
+				} else {
+					log.Warnf("Activity actor '%s': FAILED to parse trace/span IDs: traceErr=%v spanErr=%v",
+						a.actorID, err1, err2)
+				}
+			} else {
+				log.Warnf("Activity actor '%s': span-id not found in trace context", a.actorID)
+			}
+		} else {
+			log.Warnf("Activity actor '%s': trace-id not found in trace context", a.actorID)
+		}
+	} else {
+		log.Warnf("Activity actor '%s': NO TRACE CONTEXT provided to executeActivity", a.actorID)
+	}
+
+	// Start consumer span for activity execution with link to producer
+	spanName := fmt.Sprintf("process %s", activityName)
+	ctx, span := otel.Tracer("dapr-workflow-activity").Start(ctx, spanName,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithLinks(spanLinks...),
+	)
+	defer func() {
+		span.End()
+	}()
+
+	consumerSpanCtx := span.SpanContext()
+	log.Infof("Activity actor '%s': CREATED CONSUMER SPAN: spanName='%s' traceID=%s spanID=%s hasLinks=%d",
+		a.actorID, spanName, consumerSpanCtx.TraceID(), consumerSpanCtx.SpanID(), len(spanLinks))
+
+	span.SetAttributes(
+		attribute.String("messaging.operation.name", "process"),
+		attribute.String("workflow.activity.name", activityName),
+		attribute.String("workflow.instance.id", workflowID),
+		attribute.Int64("workflow.activity.sequence_number", int64(taskEvent.GetEventId())),
+	)
 
 	wi := &backend.ActivityWorkItem{
 		SequenceNumber: int64(taskEvent.GetEventId()),
@@ -67,9 +149,11 @@ func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *
 
 	if errors.Is(err, context.DeadlineExceeded) {
 		diag.DefaultWorkflowMonitoring.ActivityOperationEvent(ctx, activityName, diag.StatusRecoverable, elapsed)
+		span.RecordError(err)
 		return wferrors.NewRecoverable(fmt.Errorf("timed-out trying to schedule an activity execution - this can happen if too many activities are running in parallel or if the workflow engine isn't running: %w", err))
 	} else if err != nil {
 		diag.DefaultWorkflowMonitoring.ActivityOperationEvent(ctx, activityName, diag.StatusRecoverable, elapsed)
+		span.RecordError(err)
 		return wferrors.NewRecoverable(fmt.Errorf("failed to schedule an activity execution: %w", err))
 	}
 	diag.DefaultWorkflowMonitoring.ActivityOperationEvent(ctx, activityName, diag.StatusSuccess, elapsed)
@@ -106,6 +190,7 @@ func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *
 	if err != nil {
 		// Returning non-recoverable error
 		executionStatus = diag.StatusFailed
+		span.RecordError(err)
 		return err
 	}
 
@@ -127,11 +212,13 @@ func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *
 		if strings.HasSuffix(err.Error(), api.ErrInstanceNotFound.Error()) {
 			log.Errorf("Activity actor '%s': workflow actor instance not found when reporting activity result for workflow with instanceId '%s': %s", a.actorID, wi.InstanceID, err)
 			executionStatus = diag.StatusFailed
+			span.RecordError(err)
 			return nil
 		}
 
 		// Returning recoverable error, record metrics
 		executionStatus = diag.StatusRecoverable
+		span.RecordError(err)
 		return wferrors.NewRecoverable(fmt.Errorf("failed to invoke '%s' method on workflow actor: %w", todo.AddWorkflowEventMethod, err))
 	case wi.Result.GetTaskCompleted() != nil:
 		// Activity execution completed successfully

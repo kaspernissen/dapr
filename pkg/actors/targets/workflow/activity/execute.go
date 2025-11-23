@@ -107,6 +107,12 @@ func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *
 	}
 
 	// Start consumer span for activity execution with link to producer
+	// If we have a producer span context, use it as the parent to continue the trace
+	if len(spanLinks) > 0 {
+		// Inject the producer span context as remote parent to continue the trace
+		ctx = trace.ContextWithRemoteSpanContext(ctx, spanLinks[0].SpanContext)
+	}
+
 	spanName := fmt.Sprintf("process %s", activityName)
 	ctx, span := otel.Tracer("dapr-workflow-activity").Start(ctx, spanName,
 		trace.WithSpanKind(trace.SpanKindConsumer),
@@ -133,6 +139,11 @@ func (a *activity) executeActivity(ctx context.Context, name string, taskEvent *
 		NewEvent:       taskEvent,
 		Properties:     make(map[string]any),
 	}
+
+	// The consumer span context is already active in ctx and will be
+	// automatically propagated via gRPC metadata by the OTel instrumentation
+	log.Infof("Activity actor '%s': Consumer span context will be propagated via gRPC metadata: traceID=%s spanID=%s",
+		a.actorID, consumerSpanCtx.TraceID(), consumerSpanCtx.SpanID())
 
 	// Executing activity code is a one-way operation. We must wait for the app code to report its completion, which
 	// will trigger this callback channel.

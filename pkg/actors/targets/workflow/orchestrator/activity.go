@@ -67,8 +67,7 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 	activityName := ts.GetName()
 	spanName := fmt.Sprintf("schedule %s", activityName)
 
-	// Use stored trace context as span link for activity scheduling span
-	var spanLinks []trace.Link
+	// Use stored trace context to continue the workflow trace
 	if state.TraceContext != nil {
 		tc := state.TraceContext
 		traceID, err1 := trace.TraceIDFromHex(tc.TraceID)
@@ -83,7 +82,7 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 				traceState, _ = trace.ParseTraceState(tc.TraceState)
 			}
 
-			linkedSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+			workflowSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
 				TraceID:    traceID,
 				SpanID:     spanID,
 				TraceFlags: flags,
@@ -91,15 +90,10 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 				Remote:     true,
 			})
 
-			spanLinks = append(spanLinks, trace.Link{
-				SpanContext: linkedSpanCtx,
-				Attributes: []attribute.KeyValue{
-					attribute.String("link.type", "follows_from"),
-					attribute.String("workflow.instance.id", o.actorID),
-				},
-			})
+			// Inject workflow span context as parent to continue the trace
+			ctx = trace.ContextWithRemoteSpanContext(ctx, workflowSpanCtx)
 
-			log.Infof("Workflow actor '%s': CREATED SPAN LINK for activity '%s': linkTraceID=%s linkSpanID=%s flags=%s",
+			log.Infof("Workflow actor '%s': CONTINUING workflow trace for activity '%s': traceID=%s spanID=%s flags=%s",
 				o.actorID, activityName, traceID, spanID, flags)
 		} else {
 			log.Warnf("Workflow actor '%s': FAILED to parse stored trace context for activity '%s': traceErr=%v spanErr=%v",
@@ -111,15 +105,14 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 
 	ctx, span := otel.Tracer("dapr-workflow-orchestrator").Start(ctx, spanName,
 		trace.WithSpanKind(trace.SpanKindProducer),
-		trace.WithLinks(spanLinks...),
 	)
 	defer func() {
 		span.End()
 	}()
 
 	producerSpanCtx := span.SpanContext()
-	log.Infof("Workflow actor '%s': CREATED PRODUCER SPAN for activity '%s': spanName='%s' traceID=%s spanID=%s hasLinks=%d",
-		o.actorID, activityName, spanName, producerSpanCtx.TraceID(), producerSpanCtx.SpanID(), len(spanLinks))
+	log.Infof("Workflow actor '%s': CREATED PRODUCER SPAN for activity '%s': spanName='%s' traceID=%s spanID=%s",
+		o.actorID, activityName, spanName, producerSpanCtx.TraceID(), producerSpanCtx.SpanID())
 
 	span.SetAttributes(
 		attribute.String("messaging.operation.name", "publish"),

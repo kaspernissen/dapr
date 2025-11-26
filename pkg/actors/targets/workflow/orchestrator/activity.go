@@ -61,10 +61,7 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 		return nil
 	}
 
-	activityName := ts.GetName()
-
 	// Use stored trace context to continue the workflow trace
-	// This is the trace context captured at workflow creation time
 	if state.TraceContext != nil {
 		tc := state.TraceContext
 		traceID, err1 := trace.TraceIDFromHex(tc.TraceID)
@@ -81,19 +78,13 @@ func (o *orchestrator) callActivity(ctx context.Context, e *backend.HistoryEvent
 				traceState, _ = trace.ParseTraceState(tc.TraceState)
 			}
 
-			workflowSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+			ctx = trace.ContextWithRemoteSpanContext(ctx, trace.NewSpanContext(trace.SpanContextConfig{
 				TraceID:    traceID,
 				SpanID:     spanID,
 				TraceFlags: flags,
 				TraceState: traceState,
 				Remote:     true,
-			})
-
-			// Inject workflow span context as parent to continue the trace
-			ctx = trace.ContextWithRemoteSpanContext(ctx, workflowSpanCtx)
-		} else {
-			log.Warnf("Workflow actor '%s': failed to parse stored trace context for activity '%s': traceErr=%v spanErr=%v",
-				o.actorID, activityName, err1, err2)
+			}))
 		}
 	}
 

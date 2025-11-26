@@ -199,7 +199,6 @@ func (s *State) GetSaveRequest(actorID string) (*api.TransactionalRequest, error
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal trace context: %w", err)
 		}
-		wfLogger.Infof("SAVING TraceContext: struct=%+v json=%s", s.TraceContext, string(tcProto))
 		req.Operations = append(req.Operations, api.TransactionalOperation{
 			Operation: api.Upsert,
 			Request:   api.TransactionalUpsert{Key: traceContextKey, Value: tcProto},
@@ -394,12 +393,10 @@ func LoadWorkflowState(ctx context.Context, state state.Interface, actorID strin
 
 	// Load trace context if present
 	if len(bulkRes[traceContextKey]) > 0 {
-		wfLogger.Infof("LOADING TraceContext: raw=%s", string(bulkRes[traceContextKey]))
 		wState.TraceContext = &TraceContext{}
 		if err = json.Unmarshal(bulkRes[traceContextKey], wState.TraceContext); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal trace context: %w", err)
 		}
-		wfLogger.Infof("LOADED TraceContext: struct=%+v", wState.TraceContext)
 	}
 
 	wfLogger.Debugf("%s: loaded %d state records in %v", actorID, 1+len(bulkRes), time.Since(loadStartTime))

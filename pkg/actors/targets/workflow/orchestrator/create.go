@@ -19,11 +19,13 @@ import (
 	"fmt"
 
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"go.opentelemetry.io/otel/trace"
 
 	wfenginestate "github.com/dapr/dapr/pkg/runtime/wfengine/state"
 	"github.com/dapr/durabletask-go/api"
+	"github.com/dapr/durabletask-go/api/protos"
 	"github.com/dapr/durabletask-go/backend"
 	"github.com/dapr/durabletask-go/backend/runtimestate"
 )
@@ -70,18 +72,31 @@ func (o *orchestrator) createWorkflowInstance(ctx context.Context, request []byt
 			ActivityActorType: o.activityActorType,
 		})
 
-		// Capture trace context from incoming request for activity span propagation
+		// Capture trace context from incoming request and set it on the ExecutionStarted event
+		// This is critical for trace propagation through durabletask-go's orchestration processor
 		if spanCtx := trace.SpanFromContext(ctx).SpanContext(); spanCtx.IsValid() {
+			log.Infof("Workflow actor '%s': INCOMING span context: traceID=%s spanID=%s flags=%s (byte=%d/0x%02x) IsSampled=%v",
+				o.actorID, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags().String(),
+				byte(spanCtx.TraceFlags()), byte(spanCtx.TraceFlags()), spanCtx.IsSampled())
+
+			// Set ParentTraceContext on ExecutionStarted event for durabletask-go
+			ptc := spanContextToProtoTraceContext(spanCtx)
+			startEvent.GetExecutionStarted().ParentTraceContext = ptc
+			log.Infof("Workflow actor '%s': SET ParentTraceContext: traceparent=%s", o.actorID, ptc.GetTraceParent())
+
+			// Also store in state for backwards compatibility
+			// Use TraceFlags().String() which returns proper "01" format
+			flagsStr := spanCtx.TraceFlags().String()
+			log.Infof("Workflow actor '%s': STORING TraceContext: traceID=%s spanID=%s flags=%q (from TraceFlags().String())",
+				o.actorID, spanCtx.TraceID().String(), spanCtx.SpanID().String(), flagsStr)
 			state.TraceContext = &wfenginestate.TraceContext{
 				TraceID:    spanCtx.TraceID().String(),
 				SpanID:     spanCtx.SpanID().String(),
-				TraceFlags: fmt.Sprintf("%02x", spanCtx.TraceFlags()),
+				TraceFlags: flagsStr,
 				TraceState: spanCtx.TraceState().String(),
 			}
-			log.Infof("Workflow actor '%s': CAPTURED trace context traceID=%s spanID=%s flags=%s",
-				o.actorID, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags())
 		} else {
-			log.Warnf("Workflow actor '%s': NO TRACE CONTEXT found in create request", o.actorID)
+			log.Warnf("Workflow actor '%s': NO TRACE CONTEXT found in create request (spanCtx.IsValid=%v)", o.actorID, spanCtx.IsValid())
 		}
 
 		o.rstate = runtimestate.NewOrchestrationRuntimeState(o.actorID, state.CustomStatus, state.History)
@@ -113,13 +128,17 @@ func (o *orchestrator) createWorkflowInstance(ctx context.Context, request []byt
 
 		// Capture trace context for the new workflow instance
 		if spanCtx := trace.SpanFromContext(ctx).SpanContext(); spanCtx.IsValid() {
+			// Set ParentTraceContext on ExecutionStarted event for durabletask-go
+			ptc := spanContextToProtoTraceContext(spanCtx)
+			startEvent.GetExecutionStarted().ParentTraceContext = ptc
+
 			state.TraceContext = &wfenginestate.TraceContext{
 				TraceID:    spanCtx.TraceID().String(),
 				SpanID:     spanCtx.SpanID().String(),
 				TraceFlags: fmt.Sprintf("%02x", spanCtx.TraceFlags()),
 				TraceState: spanCtx.TraceState().String(),
 			}
-			log.Infof("Workflow actor '%s': CAPTURED trace context for RECREATED workflow traceID=%s spanID=%s flags=%s",
+			log.Infof("Workflow actor '%s': SET ParentTraceContext for RECREATED workflow traceID=%s spanID=%s flags=%s",
 				o.actorID, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags())
 		} else {
 			log.Warnf("Workflow actor '%s': NO TRACE CONTEXT found for recreated workflow", o.actorID)
@@ -145,13 +164,17 @@ func (o *orchestrator) createIfCompleted(ctx context.Context, rs *backend.Orches
 
 	// Capture trace context for the new workflow instance
 	if spanCtx := trace.SpanFromContext(ctx).SpanContext(); spanCtx.IsValid() {
+		// Set ParentTraceContext on ExecutionStarted event for durabletask-go
+		ptc := spanContextToProtoTraceContext(spanCtx)
+		startEvent.GetExecutionStarted().ParentTraceContext = ptc
+
 		state.TraceContext = &wfenginestate.TraceContext{
 			TraceID:    spanCtx.TraceID().String(),
 			SpanID:     spanCtx.SpanID().String(),
 			TraceFlags: fmt.Sprintf("%02x", spanCtx.TraceFlags()),
 			TraceState: spanCtx.TraceState().String(),
 		}
-		log.Infof("Workflow actor '%s': CAPTURED trace context for RECREATED COMPLETED workflow traceID=%s spanID=%s flags=%s",
+		log.Infof("Workflow actor '%s': SET ParentTraceContext for RECREATED COMPLETED workflow traceID=%s spanID=%s flags=%s",
 			o.actorID, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags())
 	} else {
 		log.Warnf("Workflow actor '%s': NO TRACE CONTEXT found for recreated completed workflow", o.actorID)
@@ -188,4 +211,29 @@ func isStatusMatch(statuses []api.OrchestrationStatus, runtimeStatus api.Orchest
 		}
 	}
 	return false
+}
+
+// spanContextToProtoTraceContext converts an OTel SpanContext to a durabletask-go TraceContext protobuf.
+// The TraceParent field uses W3C Trace Context format: "version-traceId-spanId-traceFlags"
+func spanContextToProtoTraceContext(spanCtx trace.SpanContext) *protos.TraceContext {
+	// Build W3C traceparent: 00-traceId-spanId-traceFlags
+	// Use TraceFlags().String() which returns proper 2-char hex format
+	traceparent := fmt.Sprintf("00-%s-%s-%s",
+		spanCtx.TraceID().String(),
+		spanCtx.SpanID().String(),
+		spanCtx.TraceFlags().String())
+
+	tc := &protos.TraceContext{
+		TraceParent: traceparent,
+	}
+
+	// Add tracestate if present
+	if stateStr := spanCtx.TraceState().String(); stateStr != "" {
+		tc.TraceState = wrapperspb.String(stateStr)
+	}
+
+	log.Infof("spanContextToProtoTraceContext: traceID=%s spanID=%s flags=%s (byte=%02x) traceparent=%s",
+		spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags().String(), byte(spanCtx.TraceFlags()), traceparent)
+
+	return tc
 }

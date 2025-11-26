@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 
 	wfenginestate "github.com/dapr/dapr/pkg/runtime/wfengine/state"
@@ -67,6 +68,19 @@ func (o *orchestrator) createWorkflowInstance(ctx context.Context, request []byt
 			WorkflowActorType: o.actorType,
 			ActivityActorType: o.activityActorType,
 		})
+
+		// Capture orchestration trace context for future span linking
+		if spanCtx := trace.SpanFromContext(ctx).SpanContext(); spanCtx.IsValid() {
+			state.OrchestrationTraceContext = &wfenginestate.OrchestrationTraceContext{
+				TraceID:    spanCtx.TraceID().String(),
+				SpanID:     spanCtx.SpanID().String(),
+				TraceFlags: fmt.Sprintf("%02x", spanCtx.TraceFlags()),
+				TraceState: spanCtx.TraceState().String(),
+			}
+			log.Infof("Workflow actor '%s': CAPTURED orchestration trace context traceID=%s spanID=%s",
+				o.actorID, spanCtx.TraceID(), spanCtx.SpanID())
+		}
+
 		o.rstate = runtimestate.NewOrchestrationRuntimeState(o.actorID, state.CustomStatus, state.History)
 		o.ometa = o.ometaFromState(o.rstate, startEvent.GetExecutionStarted())
 		return o.scheduleWorkflowStart(ctx, startEvent, state)

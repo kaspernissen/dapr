@@ -557,6 +557,11 @@ func (abe *Actors) loadInternalState(ctx context.Context, id api.InstanceID) (*s
 	return state, nil
 }
 
+// LoadWorkflowState loads the internal workflow state for a given instance ID
+func (abe *Actors) LoadWorkflowState(ctx context.Context, id api.InstanceID) (*state.State, error) {
+	return abe.loadInternalState(ctx, id)
+}
+
 // NextOrchestrationWorkItem implements backend.Backend
 func (abe *Actors) NextOrchestrationWorkItem(ctx context.Context) (*backend.OrchestrationWorkItem, error) {
 	// Wait for the workflow actor to signal us with some work to do

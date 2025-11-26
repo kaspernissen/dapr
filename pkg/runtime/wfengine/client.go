@@ -25,6 +25,7 @@ import (
 
 	"github.com/dapr/components-contrib/workflows"
 	"github.com/dapr/kit/logger"
+	backendactors "github.com/dapr/dapr/pkg/runtime/wfengine/backends/actors"
 )
 
 // Status values are defined at: https://github.com/dapr/durabletask-go/blob/119b361079c45e368f83b223888d56a436ac59b9/internal/protos/orchestrator_service.pb.go#L42-L64
@@ -40,8 +41,9 @@ var statusMap = map[int32]string{
 }
 
 type client struct {
-	logger logger.Logger
-	client backend.TaskHubClient
+	logger         logger.Logger
+	client         backend.TaskHubClient
+	actorsBackend *backendactors.Actors
 }
 
 func (c *client) Init(metadata workflows.Metadata) error {

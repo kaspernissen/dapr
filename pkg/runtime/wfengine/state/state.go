@@ -30,10 +30,12 @@ import (
 )
 
 const (
-	inboxKeyPrefix   = "inbox"
-	historyKeyPrefix = "history"
-	customStatusKey  = "customStatus"
-	metadataKey      = "metadata"
+	inboxKeyPrefix                = "inbox"
+	historyKeyPrefix              = "history"
+	customStatusKey               = "customStatus"
+	metadataKey                   = "metadata"
+	traceContextKey               = "traceContext"
+	orchestrationTraceContextKey  = "orchestrationTraceContext"
 )
 
 var wfLogger = logger.NewLogger("dapr.runtime.actor.target.workflow.state")
@@ -54,11 +56,33 @@ type State struct {
 	CustomStatus *wrapperspb.StringValue
 	Generation   uint64
 
+	// Trace context for linking RaiseEvent spans
+	TraceContext *TraceContext
+
+	// Orchestration trace context for workflow execution
+	OrchestrationTraceContext *OrchestrationTraceContext
+
 	// change tracking
 	inboxAddedCount     int
 	inboxRemovedCount   int
 	historyAddedCount   int
 	historyRemovedCount int
+}
+
+// TraceContext stores OpenTelemetry trace context for span propagation
+type TraceContext struct {
+	TraceID    string
+	SpanID     string
+	TraceFlags string
+	TraceState string
+}
+
+// OrchestrationTraceContext stores the orchestration trace context for workflow execution
+type OrchestrationTraceContext struct {
+	TraceID    string
+	SpanID     string
+	TraceFlags string
+	TraceState string
 }
 
 // TODO: @joshvanl: remove in v1.16
@@ -181,6 +205,30 @@ func (s *State) GetSaveRequest(actorID string) (*api.TransactionalRequest, error
 		Request:   api.TransactionalUpsert{Key: metadataKey, Value: metaProto},
 	})
 
+	// Save trace context if present
+	if s.TraceContext != nil {
+		tcProto, err := json.Marshal(s.TraceContext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal trace context: %w", err)
+		}
+		req.Operations = append(req.Operations, api.TransactionalOperation{
+			Operation: api.Upsert,
+			Request:   api.TransactionalUpsert{Key: traceContextKey, Value: tcProto},
+		})
+	}
+
+	// Save orchestration trace context if present
+	if s.OrchestrationTraceContext != nil {
+		otcProto, err := json.Marshal(s.OrchestrationTraceContext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal orchestration trace context: %w", err)
+		}
+		req.Operations = append(req.Operations, api.TransactionalOperation{
+			Operation: api.Upsert,
+			Request:   api.TransactionalUpsert{Key: orchestrationTraceContextKey, Value: otcProto},
+		})
+	}
+
 	return req, nil
 }
 
@@ -294,12 +342,16 @@ func LoadWorkflowState(ctx context.Context, state state.Interface, actorID strin
 	bulkReq := &api.GetBulkStateRequest{
 		ActorType: opts.WorkflowActorType,
 		ActorID:   actorID,
-		// Initializing with size for all the inbox, history, and custom status
-		Keys: make([]string, metadata.GetInboxLength()+metadata.GetHistoryLength()+1),
+		// Initializing with size for all the inbox, history, custom status, trace context, and orchestration trace context
+		Keys: make([]string, metadata.GetInboxLength()+metadata.GetHistoryLength()+3),
 	}
 
 	var n int
 	bulkReq.Keys[n] = customStatusKey
+	n++
+	bulkReq.Keys[n] = traceContextKey
+	n++
+	bulkReq.Keys[n] = orchestrationTraceContextKey
 	n++
 	for i := range metadata.GetInboxLength() {
 		bulkReq.Keys[n] = getMultiEntryKeyName(inboxKeyPrefix, i)
@@ -362,6 +414,24 @@ func LoadWorkflowState(ctx context.Context, state state.Interface, actorID strin
 				return nil, fmt.Errorf("failed to unmarshal custom status key entry: %w", err)
 			}
 			wState.CustomStatus.Value = customStatusValue
+		}
+	}
+
+	// Load trace context if present
+	if len(bulkRes[traceContextKey]) > 0 {
+		wState.TraceContext = &TraceContext{}
+		err = json.Unmarshal(bulkRes[traceContextKey], wState.TraceContext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal trace context key entry: %w", err)
+		}
+	}
+
+	// Load orchestration trace context if present
+	if len(bulkRes[orchestrationTraceContextKey]) > 0 {
+		wState.OrchestrationTraceContext = &OrchestrationTraceContext{}
+		err = json.Unmarshal(bulkRes[orchestrationTraceContextKey], wState.OrchestrationTraceContext)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal orchestration trace context key entry: %w", err)
 		}
 	}
 

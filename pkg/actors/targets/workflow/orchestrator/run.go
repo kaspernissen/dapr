@@ -15,11 +15,15 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	actorapi "github.com/dapr/dapr/pkg/actors/api"
@@ -106,6 +110,88 @@ func (o *orchestrator) runWorkflow(ctx context.Context, reminder *actorapi.Remin
 		executionStatus = ""
 	}
 	workflowName := o.getExecutionStartedEvent(state).GetName()
+
+	// Check if there are RaiseEvent events in the inbox and create a consumer span with span link
+	var consumerSpan trace.Span
+
+	log.Infof("Workflow actor '%s': runWorkflow - Checking for RaiseEvent trace context. TraceContext=%v OrchestrationTraceContext=%v",
+		o.actorID, state.TraceContext != nil, state.OrchestrationTraceContext != nil)
+
+	if state.TraceContext != nil && state.OrchestrationTraceContext != nil {
+		// Check if any event in the inbox is a RaiseEvent
+		hasRaiseEvent := false
+		for _, e := range state.Inbox {
+			if e.GetEventRaised() != nil {
+				hasRaiseEvent = true
+				log.Infof("Workflow actor '%s': runWorkflow - Found RaiseEvent in inbox, will create consumer span with link", o.actorID)
+				break
+			}
+		}
+
+		if hasRaiseEvent {
+			log.Infof("Workflow actor '%s': runWorkflow - Attempting to create consumer span. Producer traceID=%s spanID=%s, Orch traceID=%s spanID=%s",
+				o.actorID, state.TraceContext.TraceID, state.TraceContext.SpanID,
+				state.OrchestrationTraceContext.TraceID, state.OrchestrationTraceContext.SpanID)
+			// Parse the stored orchestration span context (to use as parent)
+			orchTraceID, err := trace.TraceIDFromHex(state.OrchestrationTraceContext.TraceID)
+			if err == nil {
+				orchSpanID, err := trace.SpanIDFromHex(state.OrchestrationTraceContext.SpanID)
+				if err == nil {
+					var orchTraceFlags trace.TraceFlags
+					if flagBytes, err := hex.DecodeString(state.OrchestrationTraceContext.TraceFlags); err == nil && len(flagBytes) > 0 {
+						orchTraceFlags = trace.TraceFlags(flagBytes[0])
+					}
+
+					// Create the orchestration span context for the parent relationship
+					orchSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+						TraceID:    orchTraceID,
+						SpanID:     orchSpanID,
+						TraceFlags: orchTraceFlags,
+						Remote:     true,
+					})
+
+					// Parse the stored RaiseEvent producer span context (for span link)
+					producerTraceID, err := trace.TraceIDFromHex(state.TraceContext.TraceID)
+					if err == nil {
+						producerSpanID, err := trace.SpanIDFromHex(state.TraceContext.SpanID)
+						if err == nil {
+							var producerTraceFlags trace.TraceFlags
+							if flagBytes, err := hex.DecodeString(state.TraceContext.TraceFlags); err == nil && len(flagBytes) > 0 {
+								producerTraceFlags = trace.TraceFlags(flagBytes[0])
+							}
+
+							// Create the producer span context for the link
+							producerSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+								TraceID:    producerTraceID,
+								SpanID:     producerSpanID,
+								TraceFlags: producerTraceFlags,
+							})
+
+							// Use ContextWithRemoteSpanContext to properly enable tracing for this background context
+							// This is critical for spans created outside of HTTP/gRPC request contexts
+							ctx = trace.ContextWithRemoteSpanContext(ctx, orchSpanCtx)
+
+							// Create consumer span as child of orchestration span with link to producer span
+							tracer := otel.Tracer("dapr.runtime.wfengine")
+							ctx, consumerSpan = tracer.Start(ctx, "ProcessRaisedEvent",
+								trace.WithSpanKind(trace.SpanKindConsumer),
+								trace.WithLinks(trace.Link{
+									SpanContext: producerSpanCtx,
+								}),
+								trace.WithAttributes(
+									attribute.String("workflow.instance_id", o.actorID),
+									attribute.String("workflow.name", workflowName),
+								),
+							)
+							log.Infof("Workflow actor '%s': CREATED consumer span traceID=%s spanID=%s (parent orch span=%s) with link to producer traceID=%s spanID=%s",
+								o.actorID, consumerSpan.SpanContext().TraceID(), consumerSpan.SpanContext().SpanID(), orchSpanID, producerTraceID, producerSpanID)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Request to execute workflow
 	log.Debugf("Workflow actor '%s': scheduling workflow execution with instanceId '%s'", o.actorID, wi.InstanceID)
 	// Schedule the workflow execution by signaling the backend
@@ -121,7 +207,13 @@ func (o *orchestrator) runWorkflow(ctx context.Context, reminder *actorapi.Remin
 	o.recordWorkflowSchedulingLatency(ctx, esHistoryEvent, workflowName)
 	wfExecutionElapsedTime := float64(0)
 
+	// End the ProcessRaisedEvent consumer span when workflow execution completes
 	defer func() {
+		if consumerSpan != nil {
+			consumerSpan.End()
+			log.Infof("Workflow actor '%s': ENDED consumer span traceID=%s spanID=%s after workflow execution",
+				o.actorID, consumerSpan.SpanContext().TraceID(), consumerSpan.SpanContext().SpanID())
+		}
 		if executionStatus != "" {
 			diag.DefaultWorkflowMonitoring.WorkflowExecutionEvent(ctx, workflowName, executionStatus)
 			diag.DefaultWorkflowMonitoring.WorkflowExecutionLatency(ctx, workflowName, executionStatus, wfExecutionElapsedTime)

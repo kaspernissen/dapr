@@ -33,6 +33,8 @@ import (
 	"github.com/dapr/dapr/pkg/runtime/compstore"
 	"github.com/dapr/dapr/pkg/runtime/processor"
 	backendactors "github.com/dapr/dapr/pkg/runtime/wfengine/backends/actors"
+	"github.com/dapr/dapr/pkg/runtime/wfengine/state"
+	"github.com/dapr/durabletask-go/api"
 	"github.com/dapr/durabletask-go/backend"
 	"github.com/dapr/kit/logger"
 )
@@ -49,6 +51,7 @@ type Interface interface {
 	RuntimeMetadata() *runtimev1pb.MetadataWorkflows
 
 	ActivityActorType() string
+	LoadWorkflowState(context.Context, string) (*state.State, error)
 }
 
 type Options struct {
@@ -164,8 +167,9 @@ func New(opts Options) Interface {
 		registerGrpcServerFn: registerGrpcServerFn,
 		getWorkItemsCount:    &getWorkItemsCount,
 		client: &client{
-			logger: wfBackendLogger,
-			client: backend.NewTaskHubClient(abackend),
+			logger:        wfBackendLogger,
+			client:        backend.NewTaskHubClient(abackend),
+			actorsBackend: abackend,
 		},
 	}
 }
@@ -209,4 +213,8 @@ func (wfe *engine) RuntimeMetadata() *runtimev1pb.MetadataWorkflows {
 	return &runtimev1pb.MetadataWorkflows{
 		ConnectedWorkers: wfe.getWorkItemsCount.Load(),
 	}
+}
+
+func (wfe *engine) LoadWorkflowState(ctx context.Context, instanceID string) (*state.State, error) {
+	return wfe.backend.LoadWorkflowState(ctx, api.InstanceID(instanceID))
 }

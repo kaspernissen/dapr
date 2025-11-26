@@ -15,9 +15,13 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 
+	diag "github.com/dapr/dapr/pkg/diagnostics"
+	wfenginestate "github.com/dapr/dapr/pkg/runtime/wfengine/state"
 	"github.com/dapr/durabletask-go/api"
 	"github.com/dapr/durabletask-go/backend"
 )
@@ -41,6 +45,40 @@ func (o *orchestrator) addWorkflowEvent(ctx context.Context, historyEventBytes [
 	if err != nil {
 		return err
 	}
+
+	// Capture trace context from RaiseEvent for span linking
+	if e.GetEventRaised() != nil {
+		log.Infof("Workflow actor '%s': Processing RaiseEvent, attempting to capture trace context", o.actorID)
+
+		// Try to get span context from gRPC metadata (most reliable)
+		spanCtx, foundInMetadata := diag.SpanContextFromIncomingGRPCMetadata(ctx)
+		if foundInMetadata && spanCtx.IsValid() {
+			state.TraceContext = &wfenginestate.TraceContext{
+				TraceID:    spanCtx.TraceID().String(),
+				SpanID:     spanCtx.SpanID().String(),
+				TraceFlags: fmt.Sprintf("%02x", spanCtx.TraceFlags()),
+				TraceState: spanCtx.TraceState().String(),
+			}
+			log.Infof("Workflow actor '%s': CAPTURED RaiseEvent trace context from gRPC metadata - traceID=%s spanID=%s flags=%s",
+				o.actorID, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags())
+		} else {
+			// Fallback: try to get from context's current span
+			spanCtx = trace.SpanFromContext(ctx).SpanContext()
+			if spanCtx.IsValid() {
+				state.TraceContext = &wfenginestate.TraceContext{
+					TraceID:    spanCtx.TraceID().String(),
+					SpanID:     spanCtx.SpanID().String(),
+					TraceFlags: fmt.Sprintf("%02x", spanCtx.TraceFlags()),
+					TraceState: spanCtx.TraceState().String(),
+				}
+				log.Infof("Workflow actor '%s': CAPTURED RaiseEvent trace context from context span - traceID=%s spanID=%s flags=%s",
+					o.actorID, spanCtx.TraceID(), spanCtx.SpanID(), spanCtx.TraceFlags())
+			} else {
+				log.Warnf("Workflow actor '%s': FAILED to capture RaiseEvent trace context - no valid span context found in metadata or context", o.actorID)
+			}
+		}
+	}
+
 	log.Debugf("Workflow actor '%s': adding event to the workflow inbox", o.actorID)
 	state.AddToInbox(&e)
 

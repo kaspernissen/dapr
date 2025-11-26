@@ -19,6 +19,8 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -161,6 +163,28 @@ func (a *Universal) RaiseEventWorkflow(ctx context.Context, in *runtimev1pb.Rais
 		err := messages.ErrMissingWorkflowEventName
 		a.logger.Debug(err)
 		return emptyResponse, err
+	}
+
+	// Log the current trace context for debugging
+	currentSpan := trace.SpanFromContext(ctx)
+	if currentSpan.SpanContext().IsValid() {
+		a.logger.Infof("RaiseEventWorkflow API: Processing RaiseEvent for workflow '%s' in trace traceID=%s spanID=%s",
+			in.GetInstanceId(), currentSpan.SpanContext().TraceID(), currentSpan.SpanContext().SpanID())
+	} else {
+		a.logger.Warnf("RaiseEventWorkflow API: No valid span context found for workflow '%s'", in.GetInstanceId())
+	}
+
+	// Load orchestration trace context from workflow state
+	// Add trace reference as span attributes for cross-trace correlation
+	if state, err := a.workflowEngine.LoadWorkflowState(ctx, in.GetInstanceId()); err == nil && state != nil && state.OrchestrationTraceContext != nil {
+		if currentSpan.SpanContext().IsValid() {
+			currentSpan.SetAttributes(
+				attribute.String("dapr.workflow.orchestration.trace_id", state.OrchestrationTraceContext.TraceID),
+				attribute.String("dapr.workflow.orchestration.span_id", state.OrchestrationTraceContext.SpanID),
+			)
+			a.logger.Infof("RaiseEventWorkflow API: Added orchestration trace reference to span: orch_traceID=%s orch_spanID=%s",
+				state.OrchestrationTraceContext.TraceID, state.OrchestrationTraceContext.SpanID)
+		}
 	}
 
 	req := workflows.RaiseEventRequest{
